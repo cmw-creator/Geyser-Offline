@@ -1,0 +1,192 @@
+/*
+ * Copyright (c) 2019-2023 GeyserMC. http://geysermc.org
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ * @author GeyserMC
+ * @link https://github.com/GeyserMC/Geyser
+ */
+
+package org.geysermc.geyser.translator.protocol.java;
+
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import org.cloudburstmc.protocol.bedrock.data.inventory.crafting.recipe.RecipeData;
+import org.cloudburstmc.protocol.bedrock.packet.CraftingDataPacket;
+import org.cloudburstmc.protocol.bedrock.packet.UnlockedRecipesPacket;
+import org.geysermc.geyser.GeyserImpl;
+import org.geysermc.geyser.inventory.recipe.GeyserRecipe;
+import org.geysermc.geyser.inventory.recipe.GeyserShapedRecipe;
+import org.geysermc.geyser.inventory.recipe.GeyserShapelessRecipe;
+import org.geysermc.geyser.inventory.recipe.GeyserSmithingRecipe;
+import org.geysermc.geyser.item.Items;
+import org.geysermc.geyser.network.GameProtocol;
+import org.geysermc.geyser.session.GeyserSession;
+import org.geysermc.geyser.translator.protocol.PacketTranslator;
+import org.geysermc.geyser.translator.protocol.Translator;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.FurnaceRecipeDisplay;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.RecipeDisplay;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.RecipeDisplayEntry;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.ShapedCraftingRecipeDisplay;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.ShapelessCraftingRecipeDisplay;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.SmithingRecipeDisplay;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.slot.AnyFuelSlotDisplay;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.slot.ItemSlotDisplay;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.slot.SlotDisplay;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.slot.SmithingTrimDemoSlotDisplay;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundRecipeBookAddPacket;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+@Translator(packet = ClientboundRecipeBookAddPacket.class)
+public class JavaRecipeBookAddTranslator extends PacketTranslator<ClientboundRecipeBookAddPacket> {
+
+    @Override
+    public void translate(GeyserSession session, ClientboundRecipeBookAddPacket packet) {
+        int netId = session.getLastRecipeNetId().get();
+        Int2ObjectMap<List<String>> javaToBedrockRecipeIds = session.getJavaToBedrockRecipeIds();
+        Int2ObjectMap<GeyserRecipe> geyserRecipes = session.getCraftingRecipes();
+        CraftingDataPacket craftingDataPacket = new CraftingDataPacket();
+
+        UnlockedRecipesPacket recipesPacket = new UnlockedRecipesPacket();
+        recipesPacket.setAction(packet.isReplace() ? UnlockedRecipesPacket.ActionType.INITIALLY_UNLOCKED : UnlockedRecipesPacket.ActionType.NEWLY_UNLOCKED);
+
+        // Hacky fix, see below
+        Set<GeyserShapelessRecipe.FurnaceRecipeType> knownFurnaceRecipes = new HashSet<>();
+
+        for (ClientboundRecipeBookAddPacket.Entry entry : packet.getEntries()) {
+            RecipeDisplayEntry contents = entry.contents();
+            if (javaToBedrockRecipeIds.containsKey(contents.id())) {
+                continue;
+            }
+
+            RecipeDisplay display = contents.display();
+            // Hacky fix: on 1.26.20 and above, the client crashes when there are no furnace recipes. Furnace recipes also have to be shapeless.
+            // Before this fix, Geyser did not translate furnace recipes at all.
+            // TODO rewrite this, but properly
+            if (display instanceof FurnaceRecipeDisplay furnaceRecipe && GameProtocol.is1_26_20orHigher(session.protocolVersion())) {
+                GeyserRecipe geyserRecipe = new GeyserShapelessRecipe(contents.id(), netId, furnaceRecipe, contents.category());
+                knownFurnaceRecipes.add(GeyserShapelessRecipe.FurnaceRecipeType.fromCategory(contents.category()));
+
+                List<RecipeData> recipeData = geyserRecipe.asRecipeData(session);
+                craftingDataPacket.getCraftingData().addAll(recipeData);
+
+                List<String> bedrockRecipeIds = new ArrayList<>();
+                for (int i = 0; i < recipeData.size(); i++) {
+                    String recipeId = contents.id() + "_" + i;
+                    recipesPacket.getUnlockedRecipes().add(recipeId);
+                    bedrockRecipeIds.add(recipeId);
+                    geyserRecipes.put(netId++, geyserRecipe);
+                }
+                javaToBedrockRecipeIds.put(contents.id(), List.copyOf(bedrockRecipeIds));
+                continue;
+            }
+
+            switch (display) {
+                case ShapedCraftingRecipeDisplay shapedRecipe -> {
+                    GeyserRecipe geyserRecipe = new GeyserShapedRecipe(contents.id(), netId, shapedRecipe);
+
+                    List<RecipeData> recipeData = geyserRecipe.asRecipeData(session);
+                    craftingDataPacket.getCraftingData().addAll(recipeData);
+
+                    List<String> bedrockRecipeIds = new ArrayList<>();
+                    for (int i = 0; i < recipeData.size(); i++) {
+                        String recipeId = contents.id() + "_" + i;
+                        recipesPacket.getUnlockedRecipes().add(recipeId);
+                        bedrockRecipeIds.add(recipeId);
+                        geyserRecipes.put(netId++, geyserRecipe);
+                    }
+                    javaToBedrockRecipeIds.put(contents.id(), List.copyOf(bedrockRecipeIds));
+                }
+                case ShapelessCraftingRecipeDisplay shapelessRecipe -> {
+                    GeyserRecipe geyserRecipe = new GeyserShapelessRecipe(contents.id(), netId, shapelessRecipe);
+
+                    List<RecipeData> recipeData = geyserRecipe.asRecipeData(session);
+                    craftingDataPacket.getCraftingData().addAll(recipeData);
+
+                    List<String> bedrockRecipeIds = new ArrayList<>();
+                    for (int i = 0; i < recipeData.size(); i++) {
+                        String recipeId = contents.id() + "_" + i;
+                        recipesPacket.getUnlockedRecipes().add(recipeId);
+                        bedrockRecipeIds.add(recipeId);
+                        geyserRecipes.put(netId++, geyserRecipe);
+                    }
+                    javaToBedrockRecipeIds.put(contents.id(), List.copyOf(bedrockRecipeIds));
+                }
+                case SmithingRecipeDisplay smithingRecipe -> {
+                    if (contents.display().result() instanceof SmithingTrimDemoSlotDisplay) {
+                        // Skip these - Bedrock already knows about them from the TrimDataPacket
+                        continue;
+                    }
+
+                    GeyserSmithingRecipe geyserRecipe = new GeyserSmithingRecipe(contents.id(), netId, smithingRecipe);
+                    session.getSmithingRecipes().add(geyserRecipe);
+
+                    List<RecipeData> recipeData = geyserRecipe.asRecipeData(session);
+                    craftingDataPacket.getCraftingData().addAll(recipeData);
+
+                    netId += recipeData.size();
+                }
+                default -> {
+                    GeyserImpl.getInstance().getLogger().debug("Ignoring unknown recipe display type! " + entry);
+                }
+            }
+        }
+
+        if (GameProtocol.is1_26_20orHigher(session.protocolVersion())) {
+            int placeholderRecipes = 0;
+
+            SlotDisplay stoneSlotDisplay = new ItemSlotDisplay(Items.STONE.javaId());
+            FurnaceRecipeDisplay placeholderFurnaceRecipe = new FurnaceRecipeDisplay(stoneSlotDisplay, new AnyFuelSlotDisplay(), stoneSlotDisplay, stoneSlotDisplay, 1, 1.0F);
+
+            for (GeyserShapelessRecipe.FurnaceRecipeType type : GeyserShapelessRecipe.FurnaceRecipeType.values()) {
+                // Bedrock HAS to have a recipe or else it will crash on 1.26.20 and above, so send a bogus recipe
+                // Again, very hacky, FIXME please
+                if (!knownFurnaceRecipes.contains(type)) {
+                    int id = Integer.MIN_VALUE + placeholderRecipes;
+                    GeyserRecipe geyserRecipe = new GeyserShapelessRecipe(id, netId, placeholderFurnaceRecipe, type.categories().getFirst());
+
+                    List<RecipeData> recipeData = geyserRecipe.asRecipeData(session);
+                    craftingDataPacket.getCraftingData().addAll(recipeData);
+
+                    List<String> bedrockRecipeIds = new ArrayList<>();
+                    for (int i = 0; i < recipeData.size(); i++) {
+                        String recipeId = id + "_" + i;
+                        recipesPacket.getUnlockedRecipes().add(recipeId);
+                        bedrockRecipeIds.add(recipeId);
+                        geyserRecipes.put(netId++, geyserRecipe);
+                    }
+                    javaToBedrockRecipeIds.put(id, List.copyOf(bedrockRecipeIds));
+                    placeholderRecipes++;
+                }
+            }
+        }
+
+        if (!recipesPacket.getUnlockedRecipes().isEmpty()) {
+            // Sending an empty list here will crash the client as of 1.20.60
+            // This was definitely in the codebase the entire time and did not
+            // accidentally get refactored out during Java 1.21.3. :)
+            session.sendUpstreamPacket(craftingDataPacket);
+            session.sendUpstreamPacket(recipesPacket);
+        }
+        session.getLastRecipeNetId().set(netId);
+    }
+}
