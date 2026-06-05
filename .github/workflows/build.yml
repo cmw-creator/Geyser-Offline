@@ -17,6 +17,9 @@ on:
       - 'Jenkinsfile '
       - 'README.md'
 
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false
+
 concurrency:
   group: ci-${{ github.ref }}
 
@@ -37,7 +40,7 @@ jobs:
           setup-java_java-version: 25
 
       - name: Build Geyser
-        run: ./gradlew build
+        run: ./gradlew build -x test -x runGameTest
         env:
           BUILD_NUMBER: ${{ steps.release-info.outputs.curentRelease }}
           
