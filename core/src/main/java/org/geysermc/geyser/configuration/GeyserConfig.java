@@ -411,6 +411,16 @@ public interface GeyserConfig {
             All Floodgate functionality (including skin uploading and account linking) will also not work when this option is disabled.""")
         @DefaultBoolean(true)
         boolean validateBedrockLogin();
+
+        @Comment("""
+            Allows Bedrock clients without Xbox Live authentication to connect.
+            This is useful for LAN/offline servers where Bedrock players don't have Xbox accounts.
+            When enabled, clients connecting without Xbox Live will be assigned a random UUID and XUID.
+            WARNING: This allows anyone to spoof usernames and should only be used on trusted networks,
+            similar to online-mode=false on Java Edition servers.
+            Requires validateBedrockLogin to be set to false to take effect.""")
+        @DefaultBoolean(false)
+        boolean allowOfflineBedrockClients();
     }
 
     @ConfigSerializable

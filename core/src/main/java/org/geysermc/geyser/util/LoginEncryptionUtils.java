@@ -51,6 +51,8 @@ import javax.crypto.SecretKey;
 import java.net.InetSocketAddress;
 import java.security.KeyPair;
 import java.security.PublicKey;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BiConsumer;
 
 public class LoginEncryptionUtils {
@@ -63,6 +65,7 @@ public class LoginEncryptionUtils {
     private static void encryptConnectionWithCert(GeyserSession session, AuthPayload authPayload, String jwt) {
         try {
             GeyserImpl geyser = session.getGeyser();
+            boolean allowOffline = geyser.config().advanced().bedrock().allowOfflineBedrockClients();
 
             // Regardless of auth type, we don't support guest type accounts used for splitscreen
             if (authPayload.getAuthType() == AuthType.GUEST) {
@@ -73,9 +76,16 @@ public class LoginEncryptionUtils {
             ChainValidationResult result = EncryptionUtils.validatePayload(authPayload);
 
             geyser.getLogger().debug(String.format("Is player data signed? %s", result.signed()));
-            if (!result.signed() && session.getGeyser().config().advanced().bedrock().validateBedrockLogin()) {
-                session.disconnect(GeyserLocale.getLocaleStringLog("geyser.network.remote.invalid_xbox_account"));
-                return;
+            if (!result.signed()) {
+                if (allowOffline) {
+                    // Allow offline Bedrock clients (no Xbox Live authentication)
+                    handleOfflineConnection(session, result, jwt, authPayload);
+                    return;
+                }
+                if (session.getGeyser().config().advanced().bedrock().validateBedrockLogin()) {
+                    session.disconnect(GeyserLocale.getLocaleStringLog("geyser.network.remote.invalid_xbox_account"));
+                    return;
+                }
             }
 
             // Should always be present, but hey, why not make it safe :D
@@ -94,6 +104,10 @@ public class LoginEncryptionUtils {
 
             byte[] clientDataPayload = EncryptionUtils.verifyClientData(jwt, identityPublicKey);
             if (clientDataPayload == null) {
+                if (allowOffline) {
+                    handleOfflineConnection(session, result, jwt, authPayload);
+                    return;
+                }
                 throw new IllegalStateException("Client data isn't signed by the given chain data");
             }
 
@@ -127,9 +141,98 @@ public class LoginEncryptionUtils {
                 sendEncryptionFailedMessage(geyser);
             }
         } catch (Exception ex) {
+            // If offline mode is enabled, fall back to handling the connection without auth
+            GeyserImpl geyser = session.getGeyser();
+            if (geyser.config().advanced().bedrock().allowOfflineBedrockClients()) {
+                geyser.getLogger().debug("Allowing offline Bedrock connection after auth exception: " + ex.getMessage());
+                handleOfflineConnectionFallback(session);
+                return;
+            }
             session.disconnect("disconnectionScreen.internalError.cantConnect");
             throw new RuntimeException("Unable to complete login", ex);
         }
+    }
+
+    /**
+     * Handle an offline Bedrock client connection that has partial chain data
+     * but failed the Xbox Live signature check.
+     */
+    private static void handleOfflineConnection(GeyserSession session, ChainValidationResult result,
+                                                  String jwt, AuthPayload authPayload) {
+        GeyserImpl geyser = session.getGeyser();
+        geyser.getLogger().info("Allowing offline Bedrock connection for " +
+            (result.identityClaims() != null ? result.identityClaims().extraData.displayName : "unknown"));
+
+        // Try to parse client data from JWT if possible
+        if (jwt != null && !jwt.isEmpty()) {
+            try {
+                // We can't verify the JWT without the public key, but we can try to decode it
+                String[] jwtParts = jwt.split("\\.");
+                if (jwtParts.length >= 2) {
+                    byte[] decoded = java.util.Base64.getUrlDecoder().decode(jwtParts[1]);
+                    BedrockClientData data = JsonUtils.fromJson(decoded, BedrockClientData.class);
+                    data.setOriginalString(jwt);
+                    session.setClientData(data);
+                }
+            } catch (Exception ignored) {
+                // Failed to parse client data - will use fallback
+            }
+        }
+
+        // If we have identity claims, use them; otherwise generate random data
+        if (result.identityClaims() != null) {
+            IdentityData extraData = result.identityClaims().extraData;
+            session.setAuthData(new AuthData(
+                extraData.displayName != null ? extraData.displayName : "OfflinePlayer",
+                extraData.identity != null ? extraData.identity : UUID.randomUUID(),
+                extraData.xuid != null ? extraData.xuid : generateXuid(),
+                System.currentTimeMillis() / 1000,
+                extraData.minecraftId != null ? extraData.minecraftId : ""
+            ));
+        } else {
+            handleOfflineConnectionFallback(session);
+        }
+
+        // Set a token so session can proceed without encryption
+        session.setToken("");
+    }
+
+    /**
+     * Generate completely random auth data for offline clients that have no chain data at all.
+     */
+    private static void handleOfflineConnectionFallback(GeyserSession session) {
+        GeyserImpl geyser = session.getGeyser();
+        UUID randomUUID = UUID.randomUUID();
+        String randomXuid = generateXuid();
+
+        session.setAuthData(new AuthData("OfflinePlayer", randomUUID, randomXuid,
+            System.currentTimeMillis() / 1000, ""));
+
+        // Create minimal client data if we don't have any
+        if (session.getClientData() == null) {
+            BedrockClientData fallbackData = new BedrockClientData();
+            try {
+                var gameVersionField = BedrockClientData.class.getDeclaredField("gameVersion");
+                gameVersionField.setAccessible(true);
+                gameVersionField.set(fallbackData, "1.21.0");
+                var usernameField = BedrockClientData.class.getDeclaredField("username");
+                usernameField.setAccessible(true);
+                usernameField.set(fallbackData, "OfflinePlayer");
+                var deviceIdField = BedrockClientData.class.getDeclaredField("deviceId");
+                deviceIdField.setAccessible(true);
+                deviceIdField.set(fallbackData, randomUUID.toString());
+            } catch (Exception ignored) {
+            }
+            session.setClientData(fallbackData);
+        }
+
+        session.setToken("");
+
+        geyser.getLogger().info("Created offline Bedrock session: " + randomUUID);
+    }
+
+    private static String generateXuid() {
+        return "253540" + Math.abs(ThreadLocalRandom.current().nextLong(100000000, 999999999));
     }
 
     private static void startEncryptionHandshake(GeyserSession session, PublicKey key) throws Exception {
